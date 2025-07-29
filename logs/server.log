@@ -404,3 +404,9 @@
 [2025-07-29 10:22:43 *54954.13]	NOTICE	ProcessFactory::end() (ERRNO 1005): session[76] is closed
 [2025-07-29 10:22:43 *54959.18]	NOTICE	ProcessFactory::finish() (ERRNO 1005): session#101 does not exists, it may be closed by the other side
 [2025-07-29 10:22:43 *54959.18]	NOTICE	ProcessFactory::end() (ERRNO 1005): session[101] is closed
+[2025-07-29 12:42:17 *70437.17]	ERROR	php_swoole_server_rshutdown() (ERRNO 503): Fatal error: Uncaught Error: Call to undefined method UltraOptimizedMainServer::handleRequest() in /Users/abdelzahermashal/Code/php-projects/swoole-app/server.php:109
+Stack trace:
+#0 [internal function]: UltraOptimizedMainServer->{closure}(Object(OpenSwoole\Http\Request), Object(OpenSwoole\Http\Response))
+#1 {main}
+  thrown in /Users/abdelzahermashal/Code/php-projects/swoole-app/server.php on line 109
+[2025-07-29 12:42:17 $70419.0]	WARNING	Server::check_worker_exit_status(): worker(pid=70437, id=17) abnormal exit, status=255, signal=0
