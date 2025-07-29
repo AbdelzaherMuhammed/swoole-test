@@ -4,24 +4,27 @@ require_once __DIR__ . '/vendor/autoload.php';
 use Swoole\Http\Server;
 use Swoole\Http\Request;
 use Swoole\Http\Response;
+use Swoole\Coroutine\Client;
 
-class MainServer
+class OptimizedMainServer
 {
     private $server;
     private $microservices = [
         'hello' => 'tcp://127.0.0.1:9003',
     ];
 
+    // Connection pool for reusing TCP connections
+    private $connectionPool = [];
+    private $maxPoolSize = 10;
+
     public function __construct()
     {
-        // Create HTTP server on port 80 and HTTPS on 443
         $this->server = new Server("0.0.0.0", 80);
-
-        // Add HTTPS listener
         $this->server->addListener("0.0.0.0", 443, SWOOLE_SOCK_TCP | SWOOLE_SSL);
 
         $this->configureServer();
         $this->setupRoutes();
+        $this->initConnectionPool();
     }
 
     private function configureServer()
@@ -29,16 +32,39 @@ class MainServer
         $this->server->set([
             'worker_num' => OpenSwoole\Util::getCPUNum() * 2,
             'daemonize' => false,
-            'max_request' => 10000,
+            'max_request' => 0, // No restart limit for better performance
             'dispatch_mode' => 2,
-            'debug_mode' => 1,
+            'debug_mode' => 0, // Disable debug in production
             'enable_coroutine' => true,
+            'max_coroutine' => 3000, // Increase coroutine limit
             'log_file' => __DIR__ . '/logs/server.log',
+            'log_level' => 1, // 1 = WARNING level in OpenSwoole
 
-            // HTTPS SSL Configuration
+            // TCP optimizations
+            'open_tcp_nodelay' => true, // Disable Nagle algorithm for lower latency
+            'tcp_fastopen' => true, // Enable TCP Fast Open
+            'socket_buffer_size' => 2 * 1024 * 1024, // 2MB buffer
+
+            // HTTP optimizations
+            'package_max_length' => 8 * 1024 * 1024, // 8MB max package
+            'buffer_output_size' => 32 * 1024, // 32KB output buffer
+
+            // Connection optimizations
+            'heartbeat_check_interval' => 30,
+            'heartbeat_idle_time' => 60,
+
+            // SSL Configuration
             'ssl_cert_file' => __DIR__ . '/ssl/server.crt',
             'ssl_key_file' => __DIR__ . '/ssl/server.key',
         ]);
+    }
+
+    private function initConnectionPool()
+    {
+        // Pre-warm connection pools for each microservice
+        foreach ($this->microservices as $service => $address) {
+            $this->connectionPool[$service] = new \SplQueue();
+        }
     }
 
     private function setupRoutes()
@@ -48,13 +74,79 @@ class MainServer
         });
 
         $this->server->on('start', function ($server) {
-            echo "Main Server started on HTTP:80 and HTTPS:443\n";
+            echo "Optimized Server started on HTTP:80 and HTTPS:443\n";
             echo "Master PID: {$server->master_pid}\n";
         });
 
         $this->server->on('workerStart', function ($server, $workerId) {
-            echo "Worker #{$workerId} started\n";
+            // Pre-create some connections in each worker
+            $this->preWarmConnections();
+            echo "Worker #{$workerId} started with pre-warmed connections\n";
         });
+    }
+
+    private function preWarmConnections()
+    {
+        foreach ($this->microservices as $service => $address) {
+            for ($i = 0; $i < 3; $i++) { // Pre-create 3 connections per service
+                $client = $this->createConnection($service);
+                if ($client && $client->isConnected()) {
+                    if ($this->connectionPool[$service]->count() < $this->maxPoolSize) {
+                        $this->connectionPool[$service]->enqueue($client);
+                    }
+                }
+            }
+        }
+    }
+
+    private function createConnection($service)
+    {
+        if (!isset($this->microservices[$service])) {
+            return null;
+        }
+
+        $url = parse_url($this->microservices[$service]);
+        $client = new OpenSwoole\Coroutine\Client(OpenSwoole\Constant::SOCK_TCP);
+
+        // Optimize client settings
+        $client->set([
+            'timeout' => 0.5, // 500ms timeout instead of 1s
+            'connect_timeout' => 0.2, // 200ms connect timeout
+            'write_timeout' => 0.3,
+            'read_timeout' => 0.3,
+            'open_tcp_nodelay' => true, // Disable Nagle algorithm
+            'socket_buffer_size' => 64 * 1024, // 64KB buffer
+        ]);
+
+        if ($client->connect($url['host'], $url['port'], 0.2)) {
+            return $client;
+        }
+
+        return null;
+    }
+
+    private function getConnection($service)
+    {
+        // Try to get from pool first
+        if (!$this->connectionPool[$service]->isEmpty()) {
+            $client = $this->connectionPool[$service]->dequeue();
+            if ($client && $client->isConnected()) {
+                return $client;
+            }
+        }
+
+        // Create new connection if pool is empty
+        return $this->createConnection($service);
+    }
+
+    private function returnConnection($service, $client)
+    {
+        // Return connection to pool if it's still valid and pool isn't full
+        if ($client && $client->isConnected() && $this->connectionPool[$service]->count() < $this->maxPoolSize) {
+            $this->connectionPool[$service]->enqueue($client);
+        } else if ($client) {
+            $client->close();
+        }
     }
 
     private function handleRequest(Request $request, Response $response)
@@ -62,10 +154,8 @@ class MainServer
         $path = $request->server['request_uri'];
         $method = $request->server['request_method'];
 
-        // Add CORS headers
+        // Minimal CORS headers
         $response->header('Access-Control-Allow-Origin', '*');
-        $response->header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        $response->header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
         if ($method === 'OPTIONS') {
             $response->status(200);
@@ -73,79 +163,85 @@ class MainServer
             return;
         }
 
-        // Route handling
-        switch ($path) {
-            case '/':
-                $this->handleHome($response);
-                break;
-            case '/hello':
-                $this->proxyToMicroservice('hello', 'hello', $request, $response);
-                break;
-            default:
-                $response->status(404);
-                $response->end('Route not found');
+        // Direct routing without switch for better performance
+        if ($path === '/') {
+            $this->handleHome($response);
+        } elseif ($path === '/hello') {
+            $this->fastProxyToMicroservice('hello', 'hello', $request, $response);
+        } else {
+            $response->status(404);
+            $response->end('Not Found');
         }
     }
 
     private function handleHome(Response $response)
     {
-        $html = '
-        <html>
-        <head><title>PHP OpenSwoole Server</title></head>
-        <body>
-            <h1>Main Server Running</h1>
-            <p>Available endpoints:</p>
-            <ul>
-                <li><a href="/hello">/hello</a></li>
-            </ul>
-        </body>
-        </html>';
-
+        // Simplified HTML for faster response
+        $html = '<html><head><title>Optimized Server</title></head><body><h1>Server Running</h1><a href="/hello">Hello</a></body></html>';
         $response->header('Content-Type', 'text/html');
         $response->end($html);
     }
 
-    private function proxyToMicroservice(string $service, string $action, Request $request, Response $response)
+    private function fastProxyToMicroservice(string $service, string $action, Request $request, Response $response)
     {
-        if (!isset($this->microservices[$service])) {
-            $response->status(404);
-            $response->end('Service not found');
-            return;
-        }
-
         go(function() use ($service, $action, $request, $response) {
+            $startTime = microtime(true);
+
             try {
-                $client = new Swoole\Coroutine\Client(SWOOLE_SOCK_TCP);
+                $client = $this->getConnection($service);
 
-                // Parse microservice URL
-                $url = parse_url($this->microservices[$service]);
-
-                if (!$client->connect($url['host'], $url['port'], 1.0)) {
+                if (!$client) {
                     $response->status(503);
-                    $response->end('Service unavailable');
+                    $response->end('Service Unavailable');
                     return;
                 }
 
-                // Prepare request data
+                // Prepare minimal request data
                 $requestData = [
                     'action' => $action,
-                    'method' => $request->server['request_method'],
-                    'headers' => $request->header ?? [],
-                    'data' => $request->post ?? $request->get ?? [],
-                    'body' => $request->rawContent() ?? ''
+                    'method' => $request->server['request_method']
                 ];
 
-                $client->send(json_encode($requestData));
-                $result = $client->recv();
-                $client->close();
+                // Only add data if it exists to reduce payload size
+                if (!empty($request->post)) {
+                    $requestData['data'] = $request->post;
+                } elseif (!empty($request->get)) {
+                    $requestData['data'] = $request->get;
+                }
 
-                if ($result === false) {
+                $payload = json_encode($requestData);
+
+                // Send with error checking
+                if (!$client->send($payload)) {
+                    $this->returnConnection($service, null); // Don't return bad connection
                     $response->status(500);
-                    $response->end('Service error');
+                    $response->end('Send Failed');
                     return;
                 }
 
+                $result = $client->recv(0.5); // 500ms timeout for receive
+
+                if ($result === false || $result === '') {
+                    $this->returnConnection($service, null); // Don't return bad connection
+                    $response->status(500);
+                    $response->end('Receive Failed');
+                    return;
+                }
+
+                // Return connection to pool
+                $this->returnConnection($service, $client);
+
                 $serviceResponse = json_decode($result, true);
+
+                if (!$serviceResponse) {
+                    $response->status(500);
+                    $response->end('Invalid Response');
+                    return;
+                }
+
+                // Add timing header for debugging
+                $processingTime = round((microtime(true) - $startTime) * 1000, 2);
+                $response->header('X-Processing-Time', $processingTime . 'ms');
 
                 $response->status($serviceResponse['status'] ?? 200);
                 $response->header('Content-Type', $serviceResponse['content_type'] ?? 'application/json');
@@ -153,7 +249,7 @@ class MainServer
 
             } catch (Exception $e) {
                 $response->status(500);
-                $response->end('Internal server error: ' . $e->getMessage());
+                $response->end('Error: ' . $e->getMessage());
             }
         });
     }
@@ -164,6 +260,6 @@ class MainServer
     }
 }
 
-// Start the main server
-$mainServer = new MainServer();
-$mainServer->start();
+// Start the optimized server
+$server = new OptimizedMainServer();
+$server->start();
